@@ -8,6 +8,12 @@
  *   /monitor remove <username>      — Remove from active + archive to Old Clients
  *   /monitor grant <user>           — Owner only: grant /list access to a Discord user
  *   /monitor revoke <user>          — Owner only: revoke /list access
+ *
+ * FIXES vs previous version:
+ *   1. Uses RapidAPI instead of direct Instagram requests (Railway IPs are blocked)
+ *   2. NOT_FOUND status — rejects non-existent accounts on /add instead of monitoring them
+ *   3. Cold-start fix — on bot restart, first check is silent (no false alerts)
+ *   4. ephemeral deprecation warning fixed — uses MessageFlags
  */
 
 require("dotenv").config();
@@ -21,6 +27,7 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  MessageFlags,
   Events,
 } = require("discord.js");
 
@@ -28,7 +35,7 @@ const { monitoringBase, oldClients, permissions, MAX_ACTIVE } = require("./store
 const { checkAccount, STATUS, jitter } = require("./instagramChecker");
 
 // ── Env validation ─────────────────────────────────────────────────────────
-const REQUIRED_ENV = ["DISCORD_TOKEN", "DISCORD_CHANNEL_ID", "DISCORD_GUILD_ID"];
+const REQUIRED_ENV = ["DISCORD_TOKEN", "DISCORD_CHANNEL_ID", "DISCORD_GUILD_ID", "RAPIDAPI_KEY"];
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) {
     console.error(`❌  Missing env var: ${key}`);
@@ -180,7 +187,11 @@ async function notifyAccountUnbanned(username, account) {
 }
 
 // ── Monitor loop ───────────────────────────────────────────────────────────
-const activeTimers = {};
+const activeTimers    = {};
+// FIX: Track which accounts have completed their first check after startup.
+// On cold start, the first check just confirms current state silently — no alerts.
+// This prevents false "ban detected" / "recovered" alerts on bot restart.
+const initializedAccounts = new Set();
 
 async function scheduleCheck(username) {
   const account = monitoringBase.get(username);
@@ -199,20 +210,38 @@ async function scheduleCheck(username) {
 
     console.log(`[${new Date().toLocaleTimeString()}] @${username} (${prev.mode}) → ${result.status} | ${result.detail}`);
 
+    // ── Rate limited — back off 60s ──────────────────────────────────────
     if (result.status === STATUS.RATE_LIMITED) {
       console.warn(`⚠️  Rate limited on @${username}. Backing off 60s.`);
       activeTimers[username] = setTimeout(() => scheduleCheck(username), 60000);
       return;
     }
 
+    // ── Generic error — just retry next cycle ────────────────────────────
     if (result.status === STATUS.ERROR) {
+      scheduleCheck(username);
+      return;
+    }
+
+    // ── NOT_FOUND on a WATCH_FOR_BAN account: it was deleted ─────────────
+    // Treat NOT_FOUND the same as BANNED for accounts we were watching live
+    const effectiveStatus =
+      result.status === STATUS.NOT_FOUND ? STATUS.BANNED : result.status;
+
+    // ── COLD START FIX ───────────────────────────────────────────────────
+    // First check after restart just records current state silently.
+    if (!initializedAccounts.has(username)) {
+      initializedAccounts.add(username);
+      monitoringBase.update(username, { lastStatus: effectiveStatus });
+      console.log(`[INIT] @${username} — initial state recorded as ${effectiveStatus}. Monitoring starts now.`);
       scheduleCheck(username);
       return;
     }
 
     const updated = monitoringBase.get(username);
 
-    if (updated.mode === "WATCH_FOR_BAN" && result.status === STATUS.BANNED) {
+    // ── WATCH_FOR_BAN: alert when account goes BANNED or NOT_FOUND ───────
+    if (updated.mode === "WATCH_FOR_BAN" && effectiveStatus === STATUS.BANNED) {
       monitoringBase.update(username, {
         active:          false,
         eventDetectedAt: result.checkedAt.toISOString(),
@@ -222,7 +251,8 @@ async function scheduleCheck(username) {
       return;
     }
 
-    if (updated.mode === "WATCH_FOR_UNBAN" && result.status === STATUS.ACCESSIBLE) {
+    // ── WATCH_FOR_UNBAN: alert when banned account becomes ACCESSIBLE ─────
+    if (updated.mode === "WATCH_FOR_UNBAN" && effectiveStatus === STATUS.ACCESSIBLE) {
       monitoringBase.update(username, {
         active:          false,
         eventDetectedAt: result.checkedAt.toISOString(),
@@ -267,6 +297,7 @@ function resumeAll() {
   const active = monitoringBase.listActive();
   if (active.length) {
     console.log(`▶️  Resuming monitoring for: ${active.map((a) => a.username).join(", ")}`);
+    console.log(`ℹ️  First check per account will be silent (cold-start protection).`);
     active.forEach((a) => startMonitoring(a.username));
   } else {
     console.log("📭 No active accounts to resume.");
@@ -294,6 +325,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (id.startsWith("keep_ban_") || id.startsWith("keep_unban_")) {
       const username = id.split("_").slice(2).join("_");
+      // Mark as initialized so it doesn't re-run cold-start logic
+      initializedAccounts.add(username);
       monitoringBase.update(username, { active: true, eventDetectedAt: null });
       startMonitoring(username);
       await interaction.update({
@@ -310,7 +343,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   const sub = interaction.options.getSubcommand();
 
-  // Only read username for commands that use it
   const usernameRaw = ["add", "status", "remove"].includes(sub)
     ? (interaction.options.getString("username") || "")
     : "";
@@ -322,43 +354,61 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (!perms.ownerId) {
       permissions.setOwner(interaction.user.id);
     } else if (!permissions.isOwner(interaction.user.id)) {
-      return interaction.reply({ content: "❌ Only the **owner** can grant access.", ephemeral: true });
+      return interaction.reply({ content: "❌ Only the **owner** can grant access.", flags: MessageFlags.Ephemeral });
     }
     const target = interaction.options.getUser("user");
     permissions.grantAccess(target.id);
-    return interaction.reply({ content: `✅ **${target.tag}** can now use \`/monitor list\`.`, ephemeral: true });
+    return interaction.reply({ content: `✅ **${target.tag}** can now use \`/monitor list\`.`, flags: MessageFlags.Ephemeral });
   }
 
   // ── /monitor revoke ───────────────────────────────────────────────────────
   if (sub === "revoke") {
     if (!permissions.isOwner(interaction.user.id)) {
-      return interaction.reply({ content: "❌ Only the **owner** can revoke access.", ephemeral: true });
+      return interaction.reply({ content: "❌ Only the **owner** can revoke access.", flags: MessageFlags.Ephemeral });
     }
     const target = interaction.options.getUser("user");
     permissions.revokeAccess(target.id);
-    return interaction.reply({ content: `🚫 **${target.tag}** no longer has access to \`/monitor list\`.`, ephemeral: true });
+    return interaction.reply({ content: `🚫 **${target.tag}** no longer has access to \`/monitor list\`.`, flags: MessageFlags.Ephemeral });
   }
 
   // ── /monitor add ──────────────────────────────────────────────────────────
   if (sub === "add") {
     if (!validateUsername(username))
-      return interaction.reply({ content: "❌ Invalid username. Use only letters, numbers, `.` and `_`.", ephemeral: true });
+      return interaction.reply({ content: "❌ Invalid username. Use only letters, numbers, `.` and `_`.", flags: MessageFlags.Ephemeral });
 
     if (monitoringBase.get(username)?.active)
-      return interaction.reply({ content: `⚠️ **@${username}** is already being monitored.`, ephemeral: true });
+      return interaction.reply({ content: `⚠️ **@${username}** is already being monitored.`, flags: MessageFlags.Ephemeral });
 
     if (monitoringBase.activeCount() >= MAX_ACTIVE)
-      return interaction.reply({ content: `❌ Monitor list is full (${MAX_ACTIVE} slots). Remove one first.`, ephemeral: true });
+      return interaction.reply({ content: `❌ Monitor list is full (${MAX_ACTIVE} slots). Remove one first.`, flags: MessageFlags.Ephemeral });
 
     await interaction.deferReply();
 
-    // Try up to 3 times to get a clear result
+    // Try up to 3 times to get a definitive result
     let firstCheck;
     for (let i = 0; i < 3; i++) {
       firstCheck = await checkAccount(username);
-      if (firstCheck.status === STATUS.ACCESSIBLE || firstCheck.status === STATUS.BANNED) break;
+      if (
+        firstCheck.status === STATUS.ACCESSIBLE ||
+        firstCheck.status === STATUS.BANNED     ||
+        firstCheck.status === STATUS.NOT_FOUND
+      ) break;
       console.log(`[ADD] Attempt ${i + 1}/3: @${username} → ${firstCheck.status}, retrying in 5s...`);
       await new Promise((r) => setTimeout(r, 5000));
+    }
+
+    // ── FIX: Reject non-existent accounts immediately ────────────────────
+    if (firstCheck.status === STATUS.NOT_FOUND) {
+      return interaction.editReply({
+        content: `❌ **@${username}** doesn't exist on Instagram (account never existed, or was permanently deleted).\nNot adding to watchlist.`,
+      });
+    }
+
+    // If still erroring after 3 tries, inform user
+    if (firstCheck.status === STATUS.ERROR || firstCheck.status === STATUS.RATE_LIMITED) {
+      return interaction.editReply({
+        content: `⚠️ Could not determine status of **@${username}** after 3 attempts (${firstCheck.detail}).\nTry again in a moment.`,
+      });
     }
 
     const isBanned = firstCheck.status === STATUS.BANNED;
@@ -383,6 +433,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       checkCount:  1,
     });
 
+    // Mark as initialized — we already know the current state, no cold-start needed
+    initializedAccounts.add(username);
     startMonitoring(username);
 
     const embed = isBanned
@@ -417,7 +469,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (!permissions.canViewList(interaction.user.id)) {
       return interaction.reply({
         content: "🔒 You don't have permission. Ask the owner to run `/monitor grant @you`.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -425,7 +477,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const archived = oldClients.list();
 
     if (!active.length && !archived.length)
-      return interaction.reply({ content: "📭 No accounts in any database yet.", ephemeral: true });
+      return interaction.reply({ content: "📭 No accounts in any database yet.", flags: MessageFlags.Ephemeral });
 
     const embed = new EmbedBuilder()
       .setColor(0x5865f2)
@@ -450,22 +502,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const bannedOnes    = archived.filter((a) => a.archiveReason === "BAN_DETECTED");
       const recoveredOnes = archived.filter((a) => a.archiveReason === "UNBAN_DETECTED");
       const removedOnes   = archived.filter((a) => a.archiveReason === "MANUALLY_REMOVED");
-      if (bannedOnes.length)    embed.addFields({ name: "⚫ Banned (Past)",   value: bannedOnes.map((a)    => `⚫ **@${a.username}** — ${tsField(a.eventDetectedAt || a.archivedAt)} — took ${formatDuration(a.timeTaken)}`).join("\n") });
+      if (bannedOnes.length)    embed.addFields({ name: "⚫ Banned (Past)",    value: bannedOnes.map((a)    => `⚫ **@${a.username}** — ${tsField(a.eventDetectedAt || a.archivedAt)} — took ${formatDuration(a.timeTaken)}`).join("\n") });
       if (recoveredOnes.length) embed.addFields({ name: "🟢 Recovered (Past)", value: recoveredOnes.map((a) => `🟢 **@${a.username}** — ${tsField(a.eventDetectedAt || a.archivedAt)} — took ${formatDuration(a.timeTaken)}`).join("\n") });
       if (removedOnes.length)   embed.addFields({ name: "🗑️ Removed",          value: removedOnes.map((a)   => `🗑️ **@${a.username}** — removed ${tsField(a.archivedAt)}`).join("\n") });
     }
 
-    return interaction.reply({ embeds: [embed], ephemeral: true });
+    return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
   }
 
   // ── /monitor status ───────────────────────────────────────────────────────
   if (sub === "status") {
     if (!validateUsername(username))
-      return interaction.reply({ content: "❌ Invalid username.", ephemeral: true });
+      return interaction.reply({ content: "❌ Invalid username.", flags: MessageFlags.Ephemeral });
 
     const account = monitoringBase.get(username);
     if (!account)
-      return interaction.reply({ content: `❌ **@${username}** is not being monitored.`, ephemeral: true });
+      return interaction.reply({ content: `❌ **@${username}** is not being monitored.`, flags: MessageFlags.Ephemeral });
 
     await interaction.deferReply();
 
@@ -477,8 +529,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     });
 
     const updated = monitoringBase.get(username);
-    const colors  = { ACCESSIBLE: 0x00ff88, BANNED: 0xff4444, RATE_LIMITED: 0xffcc00, ERROR: 0x888888 };
-    const emojis  = { ACCESSIBLE: "🟢", BANNED: "🔴", RATE_LIMITED: "🟡", ERROR: "⚠️" };
+    const colors  = { ACCESSIBLE: 0x00ff88, BANNED: 0xff4444, NOT_FOUND: 0xff4444, RATE_LIMITED: 0xffcc00, ERROR: 0x888888 };
+    const emojis  = { ACCESSIBLE: "🟢", BANNED: "🔴", NOT_FOUND: "⛔", RATE_LIMITED: "🟡", ERROR: "⚠️" };
 
     const embed = new EmbedBuilder()
       .setColor(colors[result.status] || 0x888888)
@@ -501,11 +553,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
   // ── /monitor remove ───────────────────────────────────────────────────────
   if (sub === "remove") {
     if (!validateUsername(username))
-      return interaction.reply({ content: "❌ Invalid username.", ephemeral: true });
+      return interaction.reply({ content: "❌ Invalid username.", flags: MessageFlags.Ephemeral });
 
     const account = monitoringBase.get(username);
     if (!account)
-      return interaction.reply({ content: `❌ **@${username}** is not being monitored.`, ephemeral: true });
+      return interaction.reply({ content: `❌ **@${username}** is not being monitored.`, flags: MessageFlags.Ephemeral });
 
     await interaction.deferReply();
     archiveAndStop(username, "MANUALLY_REMOVED");
