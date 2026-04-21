@@ -11,10 +11,8 @@
 const fs   = require("fs");
 const path = require("path");
 
-// FIX for Railway: use DATA_DIR env var so files survive redeploys
 const DATA_DIR = process.env.DATA_DIR || __dirname;
 
-// Create the data directory if it doesn't exist (first boot on Railway)
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
@@ -99,10 +97,10 @@ const oldClients = {
   get(username) { return loadFile(OLD_CLIENTS_DB)[username.toLowerCase()] || null; },
 
   archive(record, archiveReason, resolution) {
-    const all       = loadFile(OLD_CLIENTS_DB);
-    const key       = record.username.toLowerCase();
-    const now       = Date.now();
-    const timeTaken = record.addedAt ? now - new Date(record.addedAt).getTime() : null;
+    const all        = loadFile(OLD_CLIENTS_DB);
+    const key        = record.username.toLowerCase();
+    const now        = Date.now();
+    const timeTaken  = record.addedAt ? now - new Date(record.addedAt).getTime() : null;
     const archiveKey = all[key] ? `${key}_${new Date(record.addedAt).getTime()}` : key;
 
     all[archiveKey] = {
@@ -135,7 +133,7 @@ const permissions = {
 
   canViewList(userId) {
     const data = this.load();
-    if (!data.ownerId) return true; // no owner yet — anyone can view
+    if (!data.ownerId) return true;
     if (data.ownerId === userId) return true;
     return Array.isArray(data.allowedUsers) && data.allowedUsers.includes(userId);
   },
